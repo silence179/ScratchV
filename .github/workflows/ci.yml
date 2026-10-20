@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Only newer PR revisions cancel older PR runs. Pushes retain their own run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -13,6 +18,32 @@ permissions:
   contents: read
 
 jobs:
+  scope:
+    name: Select validation scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      llm: ${{ steps.scope.outputs.llm }}
+      w4: ${{ steps.scope.outputs.w4 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Preserve deployment and documentation path scopes
+        id: scope
+        run: python3 scripts/ci_scope.py
+
+  llm:
+    name: Deployment acceptance
+    needs: scope
+    if: github.event_name == 'pull_request' && needs.scope.outputs.llm == 'true'
+    uses: ./.github/workflows/llm-deploy.yml
+
+  topic06:
+    name: Topic 06 benchmark
+    uses: ./.github/workflows/topic06-benchmark.yml
+
   # ═════════════════════════════════════════════════════════════════════════
   # 课题功能测试：所有14个模块的单元测试 + 集成测试
   # ═════════════════════════════════════════════════════════════════════════
@@ -92,10 +123,24 @@ jobs:
           echo "Using python: $($PY -c 'import sys; print(sys.executable, sys.version)')"
           $PY -m pip install --upgrade pip setuptools wheel
           $PY -m pip install -e ".[all]"
-          $PY -m pip install "pytest>=7,<10"
+          $PY -m pip install "pytest>=7,<10" "PyYAML==6.0.3"
+
+      - name: Install pinned CPU dependencies for Qwen and W3 tests
+        run: |
+          set -euo pipefail
+          # The full test suite collects W3 subgraph and workflow tests.
+          # Install their actual dependencies instead of skipping those tests.
+          $PY -m pip install "torch==2.7.1" --index-url https://download.pytorch.org/whl/cpu
+          $PY -m pip install -r requirements/qwen3-small-probe.txt "PyYAML==6.0.3"
+          $PY -m pip check
+          $PY -c "import torch, yaml, safetensors; assert torch.__version__ == '2.7.1+cpu' and torch.version.cuda is None, torch.__version__"
+
+      # Unconditional: a docs-only change never selects the deployment scope, so
+      # this check cannot live behind a path filter.
+      - name: Check public instructions and Bash syntax
+        run: $PY scripts/check_linux_repro_docs.py --check-bash
 
       - name: Run Topic 04 PassManager regressions
-        id: topic04_pass_manager
         env:
           PYTHONHASHSEED: "0"
         run: |
@@ -109,20 +154,6 @@ jobs:
             -v --tb=short \
             --junit-xml=benchmark_reports/topic04_pass_manager.xml \
             | tee benchmark_reports/topic04_pass_manager.txt
-
-      - name: Summarize Topic 04 PassManager results
-        if: always()
-        env:
-          TOPIC04_OUTCOME: ${{ steps.topic04_pass_manager.outcome }}
-        run: |
-          {
-            echo "## Topic 04 PassManager"
-            echo "Result: $TOPIC04_OUTCOME"
-            echo ""
-            echo "Coverage: pass registration, enable/disable switches, constant folding, functional pipelines, and optimizer regressions."
-            echo ""
-            echo "JUnit XML and detailed test output are included in the test-reports artifact when tests run."
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run IR interpreter and LICM regressions
         timeout-minutes: 5
@@ -171,6 +202,9 @@ jobs:
         env:
           PYTHONHASHSEED: "0"
           SCRATCHV_REQUIRE_RISCV_EXECUTION: "1"
+          OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: |
           mkdir -p benchmark_reports
           $PY -m pytest tests/ -v --tb=short \
@@ -640,6 +674,10 @@ jobs:
       - name: Write job summary
         if: always()
         run: |
+          echo "## Compiler benchmarks" >> "$GITHUB_STEP_SUMMARY"
+          echo "Detailed measurements and diagnostics are retained below and in the benchmark artifact." >> "$GITHUB_STEP_SUMMARY"
+          echo "<details><summary>Compiler benchmark details</summary>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ -f benchmark_reports/ir_interpreter.md ]; then
             cat benchmark_reports/ir_interpreter.md >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -692,6 +730,7 @@ jobs:
           if [ -f benchmark_reports/ir_verifier.md ]; then
             cat benchmark_reports/ir_verifier.md >> "$GITHUB_STEP_SUMMARY"
           fi
+          echo "</details>" >> "$GITHUB_STEP_SUMMARY"
 
   # ═════════════════════════════════════════════════════════════════════════
   # GitHub Pages 部署 (仅 main 分支)
@@ -710,3 +749,18 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+  acceptance:
+    name: CI acceptance
+    if: always()
+    needs: [scope, test, benchmark, topic06, llm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Summarize and require every selected check
+        env:
+          CI_JOB_RESULTS: ${{ toJSON(needs) }}
+        run: python3 scripts/summarize_ci.py >> "$GITHUB_STEP_SUMMARY"
